@@ -6,7 +6,8 @@ Frame structure is same as [RS92-SGP](https://brmlab.cz/project/weathersonde/tel
 Unlike other members of RS41 family, RS41-D use Manchester encoding (instead of data whitening) and data bytes are sent in form of asynchonous serial protocol (1 start bit, 8 bits of data, 1 stop bit). Transmition is continual. All these properties are shared with previous generation - RS92-D.
 However frame format is more similiar to other RS41 models.
 
-![RS41-D_frame](RS41-D_frame.png?raw=true "Randomly selected RS41-D frame")
+![RS41-D_frame](RS41-D_frame.png?raw=true)
+*Randomly selected RS41-D frame. In other words it's the first frame of my audio record. It accidentally hit subframe fragment #0x21 which contains sonde type and that string is surprisingly "RS41-SGP".*
 
 | Offset | Size[bytes] | Description                            |
 | ------ | ----------- | -------------------------------------- |
@@ -26,6 +27,7 @@ Frame header sequence is fixed. It's used for frame start synchronizing.
 
 ## Frame payload data
 One frame contains several (3) blocks of data. Each of these have their own header and CRC.
+
 | Offset          | Size[bytes] | Description             |
 | --------------- | ----------- | ----------------------- |
 | 0               | 1           | Block ID                |
@@ -34,6 +36,7 @@ One frame contains several (3) blocks of data. Each of these have their own head
 | 2 + data length | 2           | CRC16 of payload data   |
 
 RS41-D is sending 3 data blocks inside one frame. (one frame takes one second)
+
 | Block ID | Size[bytes] | Description                       |
 | -------- | ----------- | --------------------------------- |
 | 0x79     | 0x28 (40)   | Status and calib/config fragment  |
