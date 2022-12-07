@@ -1,6 +1,6 @@
 # RS92-DL (DD)
 Frame structure is same as [RS92-SGP](https://brmlab.cz/project/weathersonde/telemetry_decoding) except GPS data block which is omited.
-[rs1729 decoder](https://github.com/rs1729/RS/blob/master/demod/mod/rs92mod.c) as well as [SondeMonitor](https://www.coaa.co.uk/sondemonitor.htm) does good job receiving all telemetry.
+[rs1729 decoder](https://github.com/rs1729/RS/blob/master/demod/mod/rs92mod.c) as well as [SondeMonitor](https://www.coaa.co.uk/sondemonitor.htm) is able to decode telemetry despite the fact that it is not fully supported.
 
 # RS41-D
 Unlike other members of RS41 family, RS41-D use Manchester encoding (instead of data whitening) and data bytes are sent in form of asynchonous serial protocol (1 start bit, 8 bits of data, 1 stop bit). Transmition is continual. All these properties are shared with previous generation - RS92-D.
@@ -43,4 +43,4 @@ RS41-D is sending 3 data blocks inside one frame. (one frame takes one second)
 | 0x7A     | 0x2A (42)   | Measurement data                  |
 | 0x76     | 0x74 (116)  | Padding only                      |
 
-You can find detail description of RS41 data blocks [@bajzo/RS41_Decoding](https://github.com/bazjo/RS41_Decoding/tree/master/RS41-SGP)
+You can find detail description of RS41 data blocks [@bazjo/RS41_Decoding](https://github.com/bazjo/RS41_Decoding/tree/master/RS41-SGP)
