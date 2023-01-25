@@ -9,15 +9,17 @@ Following data is relevant for both types:
  - Windfinding is provided by Radiotheodolite system
 
 ## DECODING
-These decoders are based on [rs92mod.c](https://github.com/rs1729/RS/blob/master/demod/mod/rs92mod.c) and [rs41mod.c](https://github.com/rs1729/RS/blob/master/demod/mod/rs41mod.c) code by zilog80. They require FM demodulated WAV audio by default. This might be a wave file record or stream provided by [SOX](https://sourceforge.net/projects/sox/) from pipe or from PC audio comming out of SDR application. Output is text and/or json data.
+These decoders are based on [rs92mod.c](https://github.com/rs1729/RS/blob/master/demod/mod/rs92mod.c) and [rs41mod.c](https://github.com/rs1729/RS/blob/master/demod/mod/rs41mod.c) code by zilog80. They require FM demodulated WAV audio by default. This might be a wave file record or stream provided by [SOX](https://sourceforge.net/projects/sox/) from pipe or from PC audio comming out of SDR application. Output is text and/or json data. It allows sending json over UDP at the same time.
+
 Example of using SoX in windows to stream from virtual audio device:
 ```
 SOX_PATH\sox -q -t waveaudio "CABLE Output" -t wav - 2>nul | RS92D.exe
 ```
-Wave audio file decoding with signal inversion and JSON output:
+Wave audio file decoding and reporting number of corrected frame bytes (Linux):
 ```
-RS41D --invert --jsnonly record.wav
+./RS41D --eccn record.wav
 ```
+![output](images/test_and_options.png)
 
 ## RADIOSONDE HUNTING
 Tracking and physically finding radiosonde that does not transmit its position is challenging. Received air pressure data gives us approximate altitude and also allows us to calculate vertical speed. If we know launch location, it is possible to estimate impact location using wind forecast data. RS92-D battery operation time is ~4.5 hours. But the major problem would be that we basically need a direct line of sight to receive signal.

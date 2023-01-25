@@ -21,6 +21,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <sys/socket.h>
+#include <netdb.h>
+#include <unistd.h>
+#include <time.h>
 
 #ifdef CYGWIN
   #include <fcntl.h>  // cygwin: _setmode()
@@ -64,15 +68,26 @@ typedef struct {
     i8_t jsn;  // JSON output
     i8_t slt;  // silent (only raw/json)    
     i8_t dbg;
+    i8_t udp;
+    i8_t arx;
 } option_t;
+
+typedef struct {
+    char *host;
+    char *port;
+    int   sfd;
+    time_t ip_time;
+} hostcfg_t;
+static hostcfg_t hostcfg;
 
 typedef struct {
     int msglen;
     int msgpos;
     int parpos;
 } rscfg_t;
-
 static rscfg_t cfg_rs41 = { 240-6-24, 6+24, 6 };
+static char *key[10], *val[10];
+static char ecnt;
 
 #define BITS (1+8+1)  // 10
 
@@ -136,9 +151,9 @@ typedef struct {
     int out;
     int frnr;
     char id[9];
-    double alt;
     float T; float RH; float TH;
     float P;
+    i32_t alt;
     ui32_t crc;
     ui8_t frame[FRAME_LEN];
     ui8_t calibytes[51*16];
@@ -160,9 +175,9 @@ typedef struct {
     int jsn_freq;   // freq/kHz (SDR)
     float batt;     // battery voltage (V)
     ui16_t conf_fw; // firmware
-    ui16_t conf_kt; // kill timer (sec)
-    ui16_t conf_bt; // burst timer (sec)
-    ui16_t conf_cd; // kill countdown (sec) (kt or bt)
+    i16_t conf_kt; // kill timer (sec)
+    i16_t conf_bt; // burst timer (sec)
+    i16_t conf_cd; // kill countdown (sec) (kt or bt)
     ui8_t  conf_bk; // burst kill
     ui8_t  burst;   // burst detected (by sonde)
     char rstyp[9];  // RS41-SG, RS41-SGP
@@ -224,6 +239,57 @@ static int i2(ui8_t *bytes) { // 16bit signed int
     if (val & 0x8000) val -= 0x10000;
     return val;
 }
+
+static int send_UDP(char *message) {
+    struct addrinfo hints;
+    struct addrinfo *result, *rp;
+    int s;
+    size_t len;
+    double elap_minutes;
+    time_t time_now = time(NULL);
+
+    elap_minutes = difftime(time_now, hostcfg.ip_time)/60;
+    if (hostcfg.sfd == -1 || elap_minutes > 60) {  //max once per hour
+        fprintf(stderr, "resolving IP.. ");
+        if (hostcfg.sfd != -1)
+             close(hostcfg.sfd); 
+        memset(&hints, 0, sizeof(struct addrinfo));
+        hints.ai_family = AF_UNSPEC;    /* Allow IPv4 or IPv6 */
+        hints.ai_socktype = SOCK_DGRAM; /* Datagram socket */
+        hints.ai_flags = 0;
+        hints.ai_protocol = 0;          /* Any protocol */
+
+        s = getaddrinfo(hostcfg.host, hostcfg.port, &hints, &result);
+        if (s != 0) {
+            fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(s));
+            freeaddrinfo(result);
+            return -1;
+        }
+        for (rp = result; rp != NULL; rp = rp->ai_next) {
+            hostcfg.sfd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
+            if (hostcfg.sfd == -1)
+                continue;
+            if (connect(hostcfg.sfd, rp->ai_addr, rp->ai_addrlen) != -1)
+                break;                  /* Success */
+            close(hostcfg.sfd);
+            hostcfg.sfd = -1;
+        }
+        if (rp == NULL) {               /* No address succeeded */
+            fprintf(stderr, "could not connect to host\n");
+            freeaddrinfo(result);
+            return -2;
+        }
+        freeaddrinfo(result);
+        hostcfg.ip_time = time(NULL);
+        fprintf(stderr, "success\n");
+    }
+        
+    len = strlen(message);
+    if (write(hostcfg.sfd, message, len) != len) {
+        fprintf(stderr, "Unable to send UDP message\n");
+        return -3;
+    }
+}    
 
 static int crc16(gpx_t *gpx, int start, int len) {
     int crc16poly = 0x1021;
@@ -321,7 +387,7 @@ static int get_SondeID(gpx_t *gpx, int crc, int ofs) {
             memset(gpx->rstyp, 0, 9);
             gpx->freq = 0;
             gpx->conf_fw = 0;
-            gpx->conf_bt = 0;
+            gpx->conf_bt = -1;
             gpx->conf_bk = 0;
             gpx->conf_cd = -1;
             gpx->conf_kt = -1;
@@ -330,6 +396,7 @@ static int get_SondeID(gpx_t *gpx, int crc, int ofs) {
             gpx->T = -273.15f;
             gpx->RH = -1.0f;
             gpx->P = -1.0f;
+            gpx->alt  = -10000;
             // new ID:
             memcpy(gpx->id, sondeid_bytes, 8);
             gpx->id[8] = '\0';
@@ -499,6 +566,41 @@ static float get_P(gpx_t *gpx, ui32_t f, ui32_t f1, ui32_t f2, int fx)
 }
 // ---------------------------------------------------------------------------------------
 //
+// Altitude calculation using barometric formula for standard atmosphere
+static int calc_PAlt(gpx_t *gpx) {
+    float Pb, Tb, Lb, hb, RgM = 8.31446/(9.80665*0.0289644);
+    float pressure = gpx->P;  //hPa
+
+    if (pressure <= 0.0f) return -1;
+    if (pressure < 8.6802) {
+        Pb = 8.6802;
+        Tb = 228.65;
+        Lb = 0.0028;
+        hb = 32000.0;
+    }
+    else if (pressure < 54.7489) {
+        Pb = 54.7489;
+        Tb = 216.65;
+        Lb = 0.001;
+        hb = 20000.0;
+    }
+    else if (pressure < 226.321) {
+        Pb = 226.321;
+        Tb = 216.65;
+        Lb = 0.0;
+        hb = 11000.0;
+    }
+    else {                 
+        Pb = 1013.25;
+        Tb = 288.15;
+        Lb = -0.0065;
+        hb = 0.0;
+    }
+
+    if (Lb == 0.0) gpx->alt = round(hb - RgM*Tb*log(pressure/Pb));
+    else           gpx->alt = round(hb + Tb/Lb*(pow(pressure/Pb, -RgM*Lb)-1.0));
+    return 0;
+}
 
 
 static int get_PTU(gpx_t *gpx, int ofs, int pck) {
@@ -559,6 +661,7 @@ static int get_PTU(gpx_t *gpx, int ofs, int pck) {
         }
         gpx->P = P;
 
+        calc_PAlt(gpx);
 
         if (gpx->option.dbg == 1 && (gpx->crc & crc_PTU)==0)
         {
@@ -577,7 +680,7 @@ static int get_PTU(gpx_t *gpx, int ofs, int pck) {
                 printf(" TH:%.2f ", TH);
             }
             printf("\n");
-            printf("    %9.2f ; %6.1f ; %6.1f ", gpx->alt, gpx->ptu_Rf1, gpx->ptu_Rf2);
+            printf("    %6.1f ; %6.1f ", gpx->ptu_Rf1, gpx->ptu_Rf2);
             printf("; %10.6f ; %10.6f ; %10.6f ", gpx->ptu_calT1[0], gpx->ptu_calT1[1], gpx->ptu_calT1[2]);
             //printf(";  %8d ; %8d ; %8d ", meas[0], meas[1], meas[2]);
             printf("; %10.6f ; %10.6f ", gpx->ptu_calH[0], gpx->ptu_calH[1]);
@@ -727,6 +830,7 @@ static int prn_ptu(gpx_t *gpx) {
     if (gpx->P > 0.0) {
         if (gpx->P < 100.0) fprintf(stdout, " P=%.2fhPa ", gpx->P);
         else                fprintf(stdout, " P=%.1fhPa ", gpx->P);
+    if (gpx->alt > -10000)  fprintf(stdout, " alt=%dm ", gpx->alt);
     }
 
     // dew point
@@ -749,7 +853,7 @@ static int print_position(gpx_t *gpx, int ec) {
     int err = 0, err0 = 0;
     int out;
     int ofs_ptu = 0, pck_ptu = 0;
-    if (gpx->option.slt) out = 0; else out = 1;
+    if (gpx->option.slt || gpx->option.jsn==2) out = 0; else out = 1;
 
     if ( ec >= 0 )
     {
@@ -819,43 +923,81 @@ static int print_position(gpx_t *gpx, int ec) {
 
                 if (out) fprintf(stdout, "\n");
 
-                if (gpx->option.jsn) {
+                if (gpx->option.jsn || gpx->option.udp) {
                     // Print out telemetry data as JSON
                     if (!err && !err0) {
+                        char str[200], sentence[1000];
                         char *ver_jsn = NULL;
-                        fprintf(stdout, "{ \"type\": \"%s\"", "RS41");
-                        fprintf(stdout, ", \"frame\": %d, \"id\": \"%s\", \"bt\": %d, \"cd\": %d, \"batt\": %.2f, \"burst\": %d",
-                                       gpx->frnr, gpx->id, gpx->conf_bt, gpx->conf_cd, gpx->batt, gpx->burst);
+                        sprintf(sentence, "{\"type\":\"RS41\", \"subtype\":\"RS41-D\"");
+                        sprintf(str, ", \"frame\":%d, \"id\":\"%s\", \"batt\":%.2f, \"burst\":%d",
+                                       gpx->frnr, gpx->id, gpx->batt, gpx->burst);
+                        strcat(sentence, str);
+                        if (gpx->conf_bt >= 0) {
+                            sprintf(str, ", \"bt\":%d",  gpx->conf_bt );
+                            strcat(sentence, str);
+                        }
+                        if (gpx->conf_cd >= 0) {
+                            sprintf(str, ", \"cd\":%d",  gpx->conf_cd );
+                            strcat(sentence, str);
+                        }
                         if (gpx->option.ptu) {
                             float _RH = gpx->RH;
                             if (gpx->T > -273.0) {
-                                fprintf(stdout, ", \"temp\": %.1f",  gpx->T );
+                                sprintf(str, ", \"temp\":%.1f",  gpx->T );
+                                strcat(sentence, str);
                             }
                             if (_RH > -0.5) {
-                                fprintf(stdout, ", \"humidity\": %.1f",  _RH );
+                                sprintf(str, ", \"humidity\":%.1f",  _RH );
+                                strcat(sentence, str);
                             }
                             if (gpx->P > 0.0) {
-                                fprintf(stdout, ", \"pressure\": %.2f",  gpx->P );
+                                sprintf(str, ", \"pressure\":%.2f",  gpx->P );
+                                strcat(sentence, str);
                             }
+                            if (gpx->alt >-10000 || gpx->option.arx) {
+                                sprintf(str, ", \"alt\":%d", gpx->alt);
+                                strcat(sentence, str);
+                            }                            
                         }
-                        fprintf(stdout, ", \"subtype\": \"%s\"",  "RS41-D" );
                         if (gpx->jsn_freq > 0) {  // rs41-frequency: gpx->freq
                             int fq_kHz = gpx->jsn_freq;
                             if (gpx->freq > 0) fq_kHz = gpx->freq;
-                            fprintf(stdout, ", \"freq\": %d", fq_kHz);
+                            sprintf(str, ", \"freq\":%d", fq_kHz);
+                            strcat(sentence, str);
                         }
 
                         // Include frequency derived from subframe information if available.
                         if (gpx->freq > 0) {
-                            fprintf(stdout, ", \"tx_frequency\": %d", gpx->freq );
+                            sprintf(str, ", \"tx_frequency\":%d", gpx->freq );
+                            strcat(sentence, str);
                         }
-
+                        if (gpx->option.arx) {
+                            time_t now;
+                            now = time(NULL);
+                            char dt_now[sizeof "2023-01-01T07:35:00Z"];
+                            strftime(dt_now, sizeof dt_now, "%FT%TZ", gmtime(&now));
+                            sprintf(str, ", \"datetime\":\"%s\", \"lat\":0.0, \"lon\":0.0", dt_now );
+                            strcat(sentence, str);
+                        }
                         #ifdef VER_JSN_STR
                             ver_jsn = VER_JSN_STR;
                         #endif
-                        if (ver_jsn && *ver_jsn != '\0') fprintf(stdout, ", \"version\": \"%s\"", ver_jsn);
-                        fprintf(stdout, " }\n");
-                        if (gpx->option.jsn<2) fprintf(stdout, "\n");
+                        if (ver_jsn && *ver_jsn != '\0') {
+                            sprintf(str, ", \"version\":\"%s\"", ver_jsn);
+                            strcat(sentence, str);
+                        }    
+                        for (int i = 0; i < ecnt; i++) {
+                            sprintf(str, ", \"%s\":\"%s\"", key[i], val[i]);
+                            strcat(sentence, str);
+                        }
+                        strcat(sentence, "}");
+                        if (!gpx->option.slt && gpx->option.jsn) {
+                            fprintf(stdout, "%s", sentence); //JSON string to sdout
+                            fprintf(stdout, "\n");
+                        }
+                        if (!gpx->option.slt && gpx->option.jsn==1) fprintf(stdout, "\n");
+                        if (gpx->option.udp)      //UDP packet
+                            send_UDP(sentence);
                     }
                 }
             }
@@ -1012,7 +1154,6 @@ int main(int argc, char *argv[]) {
 #endif
     setbuf(stdout, NULL);
 
-
     fpname = argv[0];
     ++argv;
     while ((*argv) && (!fileloaded)) {
@@ -1027,12 +1168,14 @@ int main(int argc, char *argv[]) {
             fprintf(stderr, "       --ths <x>    (peak threshold; default=%.1f)\n", thres);
             fprintf(stderr, "       --json       (adds JSON output)\n");
             fprintf(stderr, "       --jsnonly    (exclusively JSON out)\n");
+            fprintf(stderr, "       -u <host> <port> (UDP JSON output)\n");
             return 0;
         }
         else if ( (strcmp(*argv, "-v")  == 0) ) { }
         else if ( (strcmp(*argv, "--sub") == 0) ) { gpx.option.sub = 1; }
         else if ( (strcmp(*argv, "--aux") == 0) ) { }
-        else if   (strcmp(*argv, "--jsnonly") == 0) { gpx.option.jsn = 2; gpx.option.slt = 1;}
+        else if   (strcmp(*argv, "--json") == 0)    { gpx.option.jsn = 1;}
+        else if   (strcmp(*argv, "--jsnonly") == 0) { gpx.option.jsn = 2;}
         else if   (strcmp(*argv, "--eccn") == 0) { gpx.option.ecn = 1; }
         else if   (strcmp(*argv, "--ptu" ) == 0) { gpx.option.ptu = 1; }
         else if   (strcmp(*argv, "--dewp") == 0) { gpx.option.dwp = 1; }
@@ -1041,9 +1184,6 @@ int main(int argc, char *argv[]) {
         }
         else if ( (strcmp(*argv, "-i") == 0) || (strcmp(*argv, "--invert") == 0) ) {
             gpx.option.inv = 1;
-        }
-        else if   (strcmp(*argv, "--json") == 0) {
-            gpx.option.jsn = 1;
         }
         else if   (strcmp(*argv, "--jsn_cfq") == 0) {
             int frq = -1;  // center frequency / Hz
@@ -1102,9 +1242,9 @@ int main(int argc, char *argv[]) {
             option_min = 1;
         }
 */
-        else if   (strcmp(*argv, "--dbg" ) == 0) { gpx.option.dbg = 1; }
+        else if (strcmp(*argv, "--dbg" )   == 0) { gpx.option.dbg = 1; }
         else if (strcmp(*argv, "--rawhex") == 0) { rawhex = 2; }  // raw hex input
-        else if (strcmp(*argv, "-") == 0) {
+/*        else if (strcmp(*argv, "-") == 0) {
             int sample_rate = 0, bits_sample = 0, channels = 0;
             ++argv;
             if (*argv) sample_rate = atoi(*argv); else return -1;
@@ -1119,6 +1259,22 @@ int main(int argc, char *argv[]) {
             pcm.bps = bits_sample;
             pcm.nch = channels;
             option_pcmraw = 1;
+        }
+*/        else if   (strcmp(*argv, "-u") == 0) {
+            gpx.option.udp = 1;
+            hostcfg.sfd = -1;
+            ++argv;
+            if (*argv) hostcfg.host = *argv; else return -1;
+            ++argv;
+            if (*argv) hostcfg.port = *argv; else return -1;
+        }
+        else if   (strcmp(*argv, "--autorx") == 0) { gpx.option.arx = 1;}
+        else if   (strcmp(*argv, "--add") == 0) {
+            ++argv;
+            if (*argv) key[ecnt] = *argv; else return -1;
+            ++argv;
+            if (*argv) val[ecnt] = *argv; else return -1;
+            ++ecnt;
         }
         else {
             fp = fopen(*argv, "rb");
