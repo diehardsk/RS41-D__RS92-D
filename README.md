@@ -22,5 +22,6 @@ Wave audio file decoding and reporting number of corrected frame bytes (Linux):
 ![output](images/test_and_options.png)
 
 ## RADIOSONDE HUNTING
-Tracking and physically finding radiosonde that does not transmit its position is challenging. Received air pressure data gives us approximate altitude and also allows us to calculate vertical speed. If we know launch location, it is possible to estimate impact location using wind forecast data. RS92-D battery operation time is ~4.5 hours. But the major problem would be that we basically need a direct line of sight to receive signal.
-RS41-D seems to have enabled 10min burst timer by default which means it stops transmitting 10 minutes after baloon burst. This makes it pretty impossible to find.
+Tracking and physically finding radiosonde that does not transmit its position is challenging and interesting. Received air pressure data gives us approximate altitude and also allows us to calculate vertical speed. If we know launch location, it is possible to estimate impact location using wind forecast data. RS92-D battery operation time is ~4.5 hours. But the major problem would be that we basically need a direct line of sight to receive signal. It's importent to get to the estimated location and determine direction of the signal in final phase of the flight before sonde lands. Then we will most likely lose the signal. We will go in the determined direction and if the reception is restored, we will be guided by signal to the radiosonde. Good luck!
+
+RS41-D sonde seems to have enabled 10min burst timer by default which means it stops transmitting 10 minutes after baloon burst. This makes it pretty impossible to find.

@@ -41,11 +41,6 @@
 //  (b) set local compiler option, e.g.
 //      gcc -DVER_JSN_STR=\"0.0.2\" ...
 
-
-//typedef unsigned char  ui8_t;
-//typedef unsigned short ui16_t;
-//typedef unsigned int   ui32_t;
-
 #include "demod_mod.h"
 
 //#define  INCLUDESTATIC 1
@@ -61,14 +56,17 @@ typedef struct {
     i8_t raw;  // raw frames
     i8_t ecn;  // Reed-Solomon ECC Error Count
     i8_t ptu;  // PTU: measurements
-    i8_t inv;
+    i8_t inv;  // inversion
     i8_t aut;
     i8_t aux;  // aux/ozone
     i8_t jsn;  // JSON output
-    i8_t dbg;
-    i8_t udp;
-    i8_t arx;
+    i8_t dbg;  // debug
+    i8_t udp;  // UDP output
+    i8_t arx;  // auto_rx
+    i8_t dat;  // date-time
 } option_t;
+static option_t option;
+static RS_t RS;
 
 typedef struct {
     char *host;
@@ -86,10 +84,9 @@ typedef struct {
     int hdrlen;
     int frmlen;
 } rscfg_t;
-
 static rscfg_t cfg_rs92 = { 92, 240-6-24, 6, 240-24, 6, 240};
 static char *key[10], *val[10];
-static char ecnt;
+static char extracnt;
 
 /* --- RS92 digital: 8N1 manchester --- */
 #define BITS (1+8+1)  // 10
@@ -134,10 +131,8 @@ typedef struct {
     float _P;
     i32_t alt;
     unsigned short aux[4];
-    option_t option;
-    RS_t RS;
 } gpx_t;
-
+static gpx_t *gpx, *gpx1_pointer, *gpx2_pointer;
 
 /* ------------------------------------------------------------------------------------ */
 
@@ -257,7 +252,7 @@ static int send_UDP(char *message) {
     }
 }    
 
-static int crc16(gpx_t *gpx, int start, int len) {
+static int crc16(int start, int len) {
     int crc16poly = 0x1021;
     int rem = 0xFFFF, i, j;
     int byte;
@@ -279,16 +274,16 @@ static int crc16(gpx_t *gpx, int start, int len) {
     return rem;
 }
 
-static int crc_fail(gpx_t *gpx, int start, int len) {
+static int crc_fail(int start, int len) {
     int crc_frame, crc;
     crc_frame = gpx->frame[start + len] | (gpx->frame[start + len + 1] << 8);
-    crc = crc16(gpx, start, len);
+    crc = crc16(start, len);
     if (crc_frame != crc)
         return -1;
     return 0;
 }
 
-static int get_FrameNb(gpx_t *gpx) {
+static int get_FrameNb() {
     int i;
     unsigned byte;
     ui8_t frnr_bytes[2];
@@ -304,13 +299,13 @@ static int get_FrameNb(gpx_t *gpx) {
 }
 
 
-static int get_SondeID(gpx_t *gpx) {
+static int get_SondeID() {
     int i;
     unsigned byte;
     char sondeid_bytes[10];
     ui8_t calfr;
 
-    if (crc_fail(gpx, pos_FrameNb, LEN_CFG)) {
+    if (crc_fail(pos_FrameNb, LEN_CFG)) {
         gpx->crc |= crc_STAT;
         return -2;
     }
@@ -322,24 +317,34 @@ static int get_SondeID(gpx_t *gpx) {
     }
     sondeid_bytes[8] = '\0';
 
-    if ( strncmp(gpx->id, sondeid_bytes, 8) != 0 ) {
-        memset(gpx->calibytes, 0, 32*16);
-        memset(gpx->calfrchk, 0, 32);
-        memset(gpx->cal_f32, 0, 256*4);
-        gpx->calfrms = 0;
-        gpx->T = -275.15f;
-        gpx->_RH = -1.0f;
-        gpx->_P  = -1.0f;
-        gpx->alt  = -10000;
-        // new ID:
-        memcpy(gpx->id, sondeid_bytes, 8);
+    if ( strncmp(gpx->id, sondeid_bytes, 8) != 0 ) { //id doesn't match
+        //let's swap pointer between gpx1 <-> gpx2 datasets
+        gpx_t *original_pointer = gpx;   
+        if (gpx == gpx1_pointer)
+            gpx = gpx2_pointer;
+        else gpx = gpx1_pointer;
+        //copy new data frame
+        memcpy(gpx->frame, original_pointer->frame, FRAME_LEN);
+        
+        if ( strncmp(gpx->id, sondeid_bytes, 8) != 0 ) { //ID doesn't match the other dataset
+            memset(gpx->calibytes, 0, 32*16);  //reset data (only not recently used dataset)
+            memset(gpx->calfrchk, 0, 32);
+            memset(gpx->cal_f32, 0, 256*4);
+            gpx->calfrms = 0;
+            gpx->T = -275.15f;
+            gpx->_RH = -1.0f;
+            gpx->_P  = -1.0f;
+            gpx->alt  = -10000;
+            // new ID:
+            memcpy(gpx->id, sondeid_bytes, 8);  //store new ID
+        }
     }
 
     memcpy(gpx->cal_state, gpx->frame+(pos_FrameNb + 12), 2);
 
     calfr = gpx->frame[pos_CalData]; // 0..31
     if (calfr < 32) {
-        if (gpx->calfrchk[calfr] == 0) // const?
+        if (gpx->calfrchk[calfr] == 0) // if we don't have this cal. fragment yet
         {
             for (i = 0; i < 16; i++) {
                 gpx->calibytes[calfr*16 + i] = gpx->frame[pos_CalData+1+i];
@@ -369,7 +374,7 @@ static int get_SondeID(gpx_t *gpx) {
             float *pf32 = (float*)&le_dat32;
             gpx->cal_f32[idx] = *pf32;
 
-            if (gpx->option.dbg)
+            if (option.dbg)
             {
                 if (idx/10 == 3 || idx/10 == 4 || idx/10 == 5)
                 {
@@ -404,7 +409,7 @@ static float nu(float t, float t0, float y0) {
     return 1.0f / (y0 - y);
 }
 
-static int get_Meas(gpx_t *gpx) {
+static int get_Meas() {
     ui32_t temp, pres, hum1, hum2, ref1, ref2, ref3, ref4;
     ui8_t *meas24 = gpx->frame+pos_PTU;
     float T, U1, U2, _P, _rh, x;
@@ -453,7 +458,7 @@ static int get_Meas(gpx_t *gpx) {
 }
 
 // Altitude calculation using barometric formula for standard atmosphere
-static int calc_PAlt(gpx_t *gpx) {
+static int calc_PAlt() {
     float Pb, Tb, Lb, hb, RgM = 8.31446/(9.80665*0.0289644);
     float pressure = gpx->_P;  //hPa
 
@@ -490,21 +495,21 @@ static int calc_PAlt(gpx_t *gpx) {
 
 // ----------------------------------------------------------------------------------------------------
 
-static int get_PTU(gpx_t *gpx) {
-    if (crc_fail(gpx, pos_PTU, LEN_PTU)) {
+static int get_PTU() {
+    if (crc_fail(pos_PTU, LEN_PTU)) {
         gpx->crc |= crc_PTU;
         return -2;
     }
     if (gpx->calfrms > 0x20)  {
-        int ret = get_Meas(gpx);
-        calc_PAlt(gpx);        
+        int ret = get_Meas();
+        calc_PAlt();        
         return ret;
     }
     else return 0;
 }
 
 
-static int get_Aux(gpx_t *gpx) {
+static int get_Aux() {
     int i;
     unsigned short byte;
 
@@ -513,7 +518,7 @@ static int get_Aux(gpx_t *gpx) {
         gpx->aux[i] = byte;
     }
 
-    if (crc_fail(gpx, pos_AUX, LEN_AUX)) {
+    if (crc_fail(pos_AUX, LEN_AUX)) {
         gpx->crc |= crc_AUX;
         return -2;
     }
@@ -521,7 +526,7 @@ static int get_Aux(gpx_t *gpx) {
 }
 
 
-static int get_Cal(gpx_t *gpx) {
+static int get_Cal() {
     int i;
     unsigned byte;
     ui8_t calfr = 0;
@@ -532,7 +537,7 @@ static int get_Cal(gpx_t *gpx) {
     byte = gpx->frame[pos_CalData];
     calfr = byte;
 
-    if (gpx->option.sub == 1) {
+    if (option.sub == 1) {
         fprintf(stdout, "\n");
         fprintf(stdout, "[%5d] ", gpx->frnr);
         fprintf(stdout, "  0x%02x:", calfr);
@@ -550,12 +555,12 @@ static int get_Cal(gpx_t *gpx) {
         byte = bytes[0] + (bytes[1] << 8);
         freq = 1600000 + 10*byte; // kHz
         gpx->freq = freq;
-        if(gpx->option.jsn < 2) fprintf(stdout, ": fq %d", freq);
+        if(option.jsn < 2) fprintf(stdout, ": fq %d", freq);
         for (i = 0; i < 2; i++) {
             bytes[i] = gpx->frame[pos_Calfreq + 2 + i];
         }
         killtime = bytes[0] + (bytes[1] << 8); // signed?
-        if (killtime < 0xFFFF && gpx->option.jsn < 2) {
+        if (killtime < 0xFFFF && option.jsn < 2) {
             fprintf(stdout, "; KT:%ds", killtime);
         }
         gpx->conf_kt = killtime;
@@ -570,7 +575,7 @@ static int get_Cal(gpx_t *gpx) {
 #define rs_R 24
 #define rs_K (rs_N-rs_R)
 
-static int rs92_ecc(gpx_t *gpx, int msglen) {
+static int rs92_ecc(int msglen) {
 
     int i;
     int errors;
@@ -586,7 +591,7 @@ static int rs92_ecc(gpx_t *gpx, int msglen) {
     for (i = 0; i < rs_R;            i++) cw[i]      = gpx->frame[cfg_rs92.parpos+i];
     for (i = 0; i < cfg_rs92.msglen; i++) cw[rs_R+i] = gpx->frame[cfg_rs92.msgpos+i];
 
-    errors = rs_decode(&gpx->RS, cw, err_pos, err_val);
+    errors = rs_decode(&RS, cw, err_pos, err_val);
 
     for (i = 0; i < rs_R;            i++) gpx->frame[cfg_rs92.parpos+i] = cw[i];
     for (i = 0; i < cfg_rs92.msglen; i++) gpx->frame[cfg_rs92.msgpos+i] = cw[rs_R+i];
@@ -596,81 +601,86 @@ static int rs92_ecc(gpx_t *gpx, int msglen) {
 
 /* ------------------------------------------------------------------------------------ */
 
-static int print_data(gpx_t *gpx, int ec) {
+static int print_data(int ec) {
     int j = 0;
     int err1, err2, err4;
 
-    err1  = get_FrameNb(gpx);
-    err1 |= get_SondeID(gpx);
-    err2  = get_PTU(gpx);
-    err4  = get_Aux(gpx);
+    err1  = get_SondeID();
+    err1 |= get_FrameNb(); 
+    err2  = get_PTU();
+    err4  = get_Aux();
 
     if (!err1)
     {
-        if (gpx->option.jsn < 2) {
+        if (option.jsn < 2) {
             fprintf(stdout, "[%5d] ", gpx->frnr);
             fprintf(stdout, "(%s)  ", gpx->id);
             
-            if (gpx->option.dbg) {
+            if (option.dbg) {
                 ui8_t BFC = gpx->frame[pos_BitField0C];
                 ui8_t BFD = gpx->frame[pos_BitField0D];
                 fprintf(stdout, " BF="BYTE_TO_BINARY_PATTERN", "BYTE_TO_BINARY_PATTERN,
                     BYTE_TO_BINARY(BFC), BYTE_TO_BINARY(BFD));
             }
 
-            if (!err2 && gpx->option.ptu) {
+            if (!err2 && option.ptu) {
                 if (gpx->T > -273.0f) fprintf(stdout, " T=%.1fC ", gpx->T);
                 if (gpx->_RH > -0.5f) fprintf(stdout, " _RH=%.0f%% ", gpx->_RH);
                 if (gpx->_P  >  0.0f) fprintf(stdout, " _P=%.1fhPa ", gpx->_P);
                 if (gpx->alt >-10000) fprintf(stdout, " alt=%dm ", gpx->alt);
             }
 
-            if (gpx->option.aux && !err4) {
+            if (option.aux && !err4) {
                 if (gpx->aux[0] != 0 || gpx->aux[1] != 0 || gpx->aux[2] != 0 || gpx->aux[3] != 0) {
                     fprintf(stdout, " # %04x %04x %04x %04x", gpx->aux[0], gpx->aux[1], gpx->aux[2], gpx->aux[3]);
                 }
             }
 
             fprintf(stdout, "  ");
-            if (gpx->option.dbg) {
+            if (option.dbg) {
                 fprintf(stdout, "# [");
                 for (j=0; j<3; j++) fprintf(stdout, "%d", (gpx->crc>>j)&1);
                 fprintf(stdout, "]");
             }
-            if (gpx->option.ecn) {
+            if (option.ecn) {
                 if (ec > 0) fprintf(stdout, " (%d)", ec);
                 if (ec < 0) fprintf(stdout, " (-)");
             }
         }
 
-        get_Cal(gpx);
+        get_Cal();
 
-        if (gpx->option.jsn || gpx->option.udp) {
+        if (option.jsn || option.udp) {
             // Print out telemetry data as JSON
             if ((gpx->crc & crc_STAT)==0) //(!err1)
             {
                 char str[200], sentence[1000];
                 char *ver_jsn = NULL;
-                if (gpx->option.jsn==1) fprintf(stdout, "\n");
+                if (option.jsn==1) fprintf(stdout, "\n");
                 sprintf(sentence, "{\"type\":\"RS92\", \"subtype\":\"RS92-D\"");
                 sprintf(str, ", \"frame\":%d, \"id\":\"%s\"", gpx->frnr, gpx->id);
                 strcat(sentence, str);
-                if (gpx->option.ptu && !err2) {
+                if (option.ptu && !err2) {
                     if (gpx->T > -273.0f) {
                         sprintf(str, ", \"temp\":%.1f",  gpx->T );
                         strcat(sentence, str);
                     }
                     if (gpx->_RH > -0.5f) {
                         sprintf(str, ", \"humidity\":%.1f",  gpx->_RH );
+                        strcat(sentence, str);
                     }
                     if (gpx->_P > 0.0f) {
                         sprintf(str, ", \"pressure\":%.2f",  gpx->_P );
                         strcat(sentence, str);
                     }
-                    if (gpx->alt >-10000 || gpx->option.arx) {
+                    if (gpx->alt >-10000 || option.arx) {
                         sprintf(str, ", \"alt\":%d", gpx->alt);
                         strcat(sentence, str);
                     }
+                }
+                else if (option.arx && err2) {
+                    sprintf(str, ", \"alt\":%d", -10000);
+                    strcat(sentence, str);
                 }
                 if ((gpx->crc & crc_AUX)==0 && (gpx->aux[0] != 0 || gpx->aux[1] != 0 || gpx->aux[2] != 0 || gpx->aux[3] != 0)) {
                     sprintf(str, ", \"aux\":\"%04x%04x%04x%04x\"", gpx->aux[0], gpx->aux[1], gpx->aux[2], gpx->aux[3]);
@@ -687,13 +697,15 @@ static int print_data(gpx_t *gpx, int ec) {
                     sprintf(str, ", \"tx_frequency\":%d", gpx->freq );
                     strcat(sentence, str);
                 }
-                if (gpx->option.arx) {
+                if (option.arx || option.dat) {
                     time_t now;
                     now = time(NULL);
                     char dt_now[sizeof "2023-01-01T07:35:00Z"];
                     strftime(dt_now, sizeof dt_now, "%FT%TZ", gmtime(&now));
-                    sprintf(str, ", \"datetime\":\"%s\", \"lat\":0.0, \"lon\":0.0", dt_now );
+                    sprintf(str, ", \"datetime\":\"%s\"", dt_now );
                     strcat(sentence, str);
+//                    if (option.arx)
+//                        strcat(sentence, ", \"lat\":0.0, \"lon\":0.0");
                 }
                 #ifdef VER_JSN_STR
                     ver_jsn = VER_JSN_STR;
@@ -702,25 +714,28 @@ static int print_data(gpx_t *gpx, int ec) {
                     sprintf(str, ", \"version\":\"%s\"", ver_jsn);
                     strcat(sentence, str);
                 }
-                for (int i = 0; i < ecnt; i++) {
-                    sprintf(str, ", \"%s\":\"%s\"", key[i], val[i]);
+                for (int i = 0; i < extracnt; i++) {
+                    if ((val[i][0]>='0' && val[i][0]<='9') || val[i][0]=='-' || val[i][0]=='+') //number?
+                        sprintf(str, ", \"%s\":%s", key[i], val[i]);
+                    else
+                        sprintf(str, ", \"%s\":\"%s\"", key[i], val[i]);
                     strcat(sentence, str);
                 }
                 strcat(sentence, "}");
-                if (gpx->option.jsn == 1 || gpx->option.jsn == 2) {
+                if (option.jsn == 1 || option.jsn == 2) {
                     fprintf(stdout, "%s", sentence); //JSON string to sdout
                 }
-                if (gpx->option.jsn==1) fprintf(stdout, "\n");
-                if (gpx->option.udp)      //UDP packet
+                if (option.jsn==1) fprintf(stdout, "\n");
+                if (option.udp)      //UDP packet
                     send_UDP(sentence);
             }
         }
-        if (gpx->option.jsn!=3) fprintf(stdout, "\n");
+        if (option.jsn!=3) fprintf(stdout, "\n");
     }
     return err1;
 }
 
-static void print_frame(gpx_t *gpx, int len) {
+static void print_frame(int len) {
     int i, ec = 0;
     ui8_t byte;
 
@@ -730,18 +745,18 @@ static void print_frame(gpx_t *gpx, int len) {
         gpx->frame[i + pos_PADD] = RS92D_padding[i];
     }
 
-    ec = rs92_ecc(gpx, len);
+    ec = rs92_ecc(len);
 
     for (i = len; i < FRAME_LEN; i++) {
         gpx->frame[i] = 0;
     }
 
-    if (gpx->option.raw) {
+    if (option.raw) {
         for (i = 0; i < len; i++) {
             byte = gpx->frame[i];
             fprintf(stdout, "%02x", byte);
         }
-        if (gpx->option.ecn) {
+        if (option.ecn) {
             fprintf(stdout, " ");
             if (ec >= 0) fprintf(stdout, " [OK]"); else fprintf(stdout, " [NO]");
             if (ec > 0) fprintf(stdout, " (%d)", ec);
@@ -749,7 +764,7 @@ static void print_frame(gpx_t *gpx, int len) {
         }
         fprintf(stdout, "\n");
     }
-    else print_data(gpx, ec);
+    else print_data(ec);
 }
 
 /* -------------------------------------------------------------------------- */
@@ -799,7 +814,11 @@ int main(int argc, char *argv[]) {
 
     hdb_t hdb = {0};
 
-    gpx_t gpx = {0};
+    gpx_t gpx1 = {0};
+    gpx_t gpx2 = {0};
+    gpx1_pointer = &gpx1;
+    gpx2_pointer = &gpx2;
+    gpx = gpx1_pointer; //pointer to currently used dataset
 
 #ifdef CYGWIN
     _setmode(fileno(stdin), O_BINARY);
@@ -826,19 +845,19 @@ int main(int argc, char *argv[]) {
             return 0;
         }
         else if ( (strcmp(*argv, "-v")  == 0) ) { }
-        else if ( (strcmp(*argv, "--sub") == 0) ) { gpx.option.sub = 1; }
-        else if ( (strcmp(*argv, "--aux") == 0) ) { gpx.option.aux = 1; }
-        else if   (strcmp(*argv, "--jsnonly") == 0) { gpx.option.jsn = 2; }
-        else if   (strcmp(*argv, "--eccn") == 0) { gpx.option.ecn = 1; }
-        else if   (strcmp(*argv, "--ptu" ) == 0) { gpx.option.ptu = 1; }
+        else if ( (strcmp(*argv, "--sub") == 0) ) { option.sub = 1; }
+        else if ( (strcmp(*argv, "--aux") == 0) ) { option.aux = 1; }
+        else if   (strcmp(*argv, "--jsnonly") == 0) { option.jsn = 2; }
+        else if   (strcmp(*argv, "--eccn") == 0) { option.ecn = 1; }
+        else if   (strcmp(*argv, "--ptu" ) == 0) { option.ptu = 1; }
         else if ( (strcmp(*argv, "-r") == 0) || (strcmp(*argv, "--raw") == 0) ) {
-            gpx.option.raw = 1;
+            option.raw = 1;
         }
         else if ( (strcmp(*argv, "-i") == 0) || (strcmp(*argv, "--invert") == 0) ) {
-            gpx.option.inv = 1;
+            option.inv = 1;
         }
         else if   (strcmp(*argv, "--json") == 0) {
-            gpx.option.jsn = 1;
+            option.jsn = 1;
         }
         else if   (strcmp(*argv, "--jsn_cfq") == 0) {
             int frq = -1;  // center frequency / Hz
@@ -850,7 +869,7 @@ int main(int argc, char *argv[]) {
         else if   (strcmp(*argv, "--spike") == 0) { spike = 1; }
         else if   (strcmp(*argv, "--ch2") == 0) { sel_wavch = 1; }  // right channel (default: 0=left)
         else if   (strcmp(*argv, "--softin") == 0) { option_softin = 1; }  // float32 soft input
-        else if   (strcmp(*argv, "--silent") == 0) { gpx.option.jsn = 3; }
+        else if   (strcmp(*argv, "--silent") == 0) { option.jsn = 3; }
         else if   (strcmp(*argv, "--ths") == 0) {
             ++argv;
             if (*argv) {
@@ -896,7 +915,7 @@ int main(int argc, char *argv[]) {
         else if   (strcmp(*argv, "--min") == 0) {
             option_min = 1;
         }
-        else if   (strcmp(*argv, "--dbg" ) == 0) { gpx.option.dbg = 1; }
+        else if   (strcmp(*argv, "--dbg" ) == 0) { option.dbg = 1; }
         else if (strcmp(*argv, "--rawhex") == 0) { rawhex = 2; }  // raw hex input
         else if (strcmp(*argv, "-") == 0) {
             int sample_rate = 0, bits_sample = 0, channels = 0;
@@ -915,20 +934,21 @@ int main(int argc, char *argv[]) {
             option_pcmraw = 1;
         }
         else if   (strcmp(*argv, "-u") == 0) {
-            gpx.option.udp = 1;
+            option.udp = 1;
             hostcfg.sfd = -1;
             ++argv;
             if (*argv) hostcfg.host = *argv; else return -1;
             ++argv;
             if (*argv) hostcfg.port = *argv; else return -1;
         }
-        else if   (strcmp(*argv, "--autorx") == 0) { gpx.option.arx = 1;}
+        else if   (strcmp(*argv, "--autorx") == 0) { option.arx = 1;}
+        else if   (strcmp(*argv, "--datetime") == 0) { option.dat = 1;}
         else if   (strcmp(*argv, "--add") == 0) {
             ++argv;
-            if (*argv) key[ecnt] = *argv; else return -1;
+            if (*argv) key[extracnt] = *argv; else return -1;
             ++argv;
-            if (*argv) val[ecnt] = *argv; else return -1;
-            ++ecnt;
+            if (*argv) val[extracnt] = *argv; else return -1;
+            ++extracnt;
         }
         else {
             fp = fopen(*argv, "rb");
@@ -942,8 +962,8 @@ int main(int argc, char *argv[]) {
     }
     if (!fileloaded) fp = stdin;
 
-    gpx.option.ptu = 1;
-    gpx.option.aut = 0;
+    option.ptu = 1;
+    option.aut = 0;
     if (option_iq == 5 && option_dc) option_lp |= LP_FM;
 
     // LUT faster for decM, however frequency correction after decimation
@@ -951,12 +971,16 @@ int main(int argc, char *argv[]) {
     //
     if (option_noLUT && option_iq == 5) dsp.opt_nolut = 1; else dsp.opt_nolut = 0;
 
-    rs_init_RS255(&gpx.RS);
+    rs_init_RS255(&RS);
 
     // init gpx
-    memcpy(gpx.frame, RS92_header_bytes, sizeof(RS92_header_bytes)); // 6 header bytes
+    memcpy(gpx1.frame, RS92_header_bytes, sizeof(RS92_header_bytes)); // 6 header bytes
+    memcpy(gpx2.frame, RS92_header_bytes, sizeof(RS92_header_bytes));
 
-    if (cfreq > 0) gpx.jsn_freq = (cfreq+500)/1000;
+    if (cfreq > 0) {
+        gpx1.jsn_freq = (cfreq+500)/1000;
+        gpx2.jsn_freq = gpx1.jsn_freq;
+    }
 
 
     #ifdef EXT_FSK
@@ -989,7 +1013,7 @@ int main(int argc, char *argv[]) {
 
             if (cfreq > 0) {
                 int fq_kHz = (cfreq - dsp.xlt_fq*pcm.sr + 500)/1e3;
-                gpx.jsn_freq = fq_kHz;
+                gpx->jsn_freq = fq_kHz;
             }
 
             // rs92-sgp: BT=0.5, h=1.0 ?
@@ -1066,9 +1090,9 @@ int main(int argc, char *argv[]) {
             if (header_found == EOF) break;
 
             // mv == correlation score
-            if (_mv *(0.5-gpx.option.inv) < 0) {
-                if (gpx.option.aut == 0) header_found = 0;
-                else gpx.option.inv ^= 0x1;
+            if (_mv *(0.5-option.inv) < 0) {
+                if (option.aut == 0) header_found = 0;
+                else option.inv ^= 0x1;
             }
 
             if (header_found) {
@@ -1099,7 +1123,7 @@ int main(int argc, char *argv[]) {
                     }
                     if ( bitQ == EOF) break;
 
-                    if (gpx.option.inv) bit ^= 1;
+                    if (option.inv) bit ^= 1;
 
                     bitpos += 1;
                     bitbuf[b8pos] = bit;
@@ -1107,12 +1131,12 @@ int main(int argc, char *argv[]) {
                     if (b8pos >= BITS) {
                         b8pos = 0;
                         byte = bits2byte(bitbuf);
-                        gpx.frame[byte_count] = byte;
+                        gpx->frame[byte_count] = byte;
                         byte_count++;
                     }
                 }
                 header_found = 0;
-                print_frame(&gpx, byte_count);
+                print_frame(byte_count);
                 byte_count = FRAMESTART;
             }
         }
@@ -1144,9 +1168,9 @@ int main(int argc, char *argv[]) {
                 for (i = 0; i < len; i++) { //%2x  SCNx8=%hhx(inttypes.h)
                     sscanf(buffer_rawhex+2*i, "%2hhx", &frmbyte);
                     // wenn ohne %hhx: sscanf(buffer_rawhex+rawhex*i, "%2x", &byte); frame[frameofs+i] = (ui8_t)byte;
-                    gpx.frame[frameofs+i] = frmbyte;
+                    gpx->frame[frameofs+i] = frmbyte;
                 }
-                print_frame(&gpx, frameofs+len);
+                print_frame(frameofs+len);
             }
         }
     }

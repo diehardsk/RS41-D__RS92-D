@@ -41,11 +41,6 @@
 //  (b) set local compiler option, e.g.
 //      gcc -DVER_JSN_STR=\"0.0.2\" ...
 
-
-//typedef unsigned char  ui8_t;
-//typedef unsigned short ui16_t;
-//typedef unsigned int   ui32_t;
-
 #include "demod_mod.h"
 
 //#define  INCLUDESTATIC 1
@@ -62,15 +57,18 @@ typedef struct {
     i8_t ecn;  // Reed-Solomon ECC Error Count
     i8_t ptu;  // PTU: measurements
     i8_t dwp;  // PTU derived: dew point
-    i8_t inv;
+    i8_t inv;  // inversion
     i8_t aut;
 //    i8_t aux;  // aux/ozone
     i8_t jsn;  // JSON output
     i8_t slt;  // silent (only raw/json)    
-    i8_t dbg;
-    i8_t udp;
-    i8_t arx;
+    i8_t dbg;  // debug
+    i8_t udp;  // UDP output
+    i8_t arx;  // auto_rx
+    i8_t dat;  // date-time
 } option_t;
+static option_t option;
+static RS_t RS;
 
 typedef struct {
     char *host;
@@ -87,7 +85,7 @@ typedef struct {
 } rscfg_t;
 static rscfg_t cfg_rs41 = { 240-6-24, 6+24, 6 };
 static char *key[10], *val[10];
-static char ecnt;
+static char extracnt;
 
 #define BITS (1+8+1)  // 10
 
@@ -181,10 +179,9 @@ typedef struct {
     ui8_t  conf_bk; // burst kill
     ui8_t  burst;   // burst detected (by sonde)
     char rstyp[9];  // RS41-SG, RS41-SGP
-    option_t option;
-    RS_t RS;
     ecdat_t ecdat;
 } gpx_t;
+static gpx_t *gpx, *gpx1_pointer, *gpx2_pointer;
 
 /* ------------------------------------------------------------------------------------ */
 
@@ -291,7 +288,7 @@ static int send_UDP(char *message) {
     }
 }    
 
-static int crc16(gpx_t *gpx, int start, int len) {
+static int crc16(int start, int len) {
     int crc16poly = 0x1021;
     int rem = 0xFFFF, i, j;
     int byte;
@@ -314,21 +311,21 @@ static int crc16(gpx_t *gpx, int start, int len) {
     return rem;
 }
 
-static int check_CRC(gpx_t *gpx, ui32_t pos, ui32_t pck) {
+static int check_CRC(ui32_t pos, ui32_t pck) {
     ui32_t crclen = 0,
            crcdat = 0;
     if (((pck>>8) & 0xFF) != gpx->frame[pos]) return -1;
     crclen = gpx->frame[pos+1];
     if (pos + crclen + 4 > FRAME_LEN) return -1;
     crcdat = u2(gpx->frame+pos+2+crclen);
-    if ( crcdat != crc16(gpx, pos+2, crclen) ) {
+    if ( crcdat != crc16(pos+2, crclen) ) {
         return 1;  // CRC NO
     }
     else return 0; // CRC OK
 }
 
 
-static int get_FrameNb(gpx_t *gpx, int crc, int ofs) {
+static int get_FrameNb(int crc, int ofs) {
     int i;
     unsigned byte;
     ui8_t frnr_bytes[2];
@@ -350,7 +347,7 @@ static int get_FrameNb(gpx_t *gpx, int crc, int ofs) {
     return 0;
 }
 
-static int get_BattVolts(gpx_t *gpx, int ofs) {
+static int get_BattVolts(int ofs) {
     int i;
     unsigned byte;
     ui8_t batt_bytes[2];
@@ -368,7 +365,7 @@ static int get_BattVolts(gpx_t *gpx, int ofs) {
 }
 
 
-static int get_SondeID(gpx_t *gpx, int crc, int ofs) {
+static int get_SondeID(int crc, int ofs) {
     int i;
     unsigned byte;
     char sondeid_bytes[9];
@@ -380,46 +377,56 @@ static int get_SondeID(gpx_t *gpx, int crc, int ofs) {
             sondeid_bytes[i] = byte;
         }
         sondeid_bytes[8] = '\0';
-        if ( strncmp(gpx->id, sondeid_bytes, 8) != 0 ) {
-            //for (i = 0; i < 51; i++) gpx->calfrchk[i] = 0;
-            memset(gpx->calfrchk, 0, 51); // 0x00..0x32
-            // reset conf data
-            memset(gpx->rstyp, 0, 9);
-            gpx->freq = 0;
-            gpx->conf_fw = 0;
-            gpx->conf_bt = -1;
-            gpx->conf_bk = 0;
-            gpx->conf_cd = -1;
-            gpx->conf_kt = -1;
-            gpx->burst = -1;
-            // don't reset gpx->frame[] !
-            gpx->T = -273.15f;
-            gpx->RH = -1.0f;
-            gpx->P = -1.0f;
-            gpx->alt  = -10000;
-            // new ID:
-            memcpy(gpx->id, sondeid_bytes, 8);
-            gpx->id[8] = '\0';
+        if ( strncmp(gpx->id, sondeid_bytes, 8) != 0 ) { //id doesn't match
+            //let's swap pointer between gpx1 <-> gpx2 datasets
+            gpx_t *original_pointer = gpx;   
+            if (gpx == gpx1_pointer)
+                gpx = gpx2_pointer;
+            else gpx = gpx1_pointer;
+            //copy new data frame
+            memcpy(gpx->frame, original_pointer->frame, FRAME_LEN);
 
-            gpx->ecdat.last_frnb = 0;
+            if ( strncmp(gpx->id, sondeid_bytes, 8) != 0 ) { //ID doesn't match the other dataset
+                                                               //reset data (only not recently used dataset)
+                memset(gpx->calfrchk, 0, 51); // 0x00..0x32
+                // reset conf data
+                memset(gpx->rstyp, 0, 9);
+                gpx->freq = 0;
+                gpx->conf_fw = 0;
+                gpx->conf_bt = -1;
+                gpx->conf_bk = 0;
+                gpx->conf_cd = -1;
+                gpx->conf_kt = -1;
+                gpx->burst = -1;
+                // don't reset gpx->frame[] !
+                gpx->T = -273.15f;
+                gpx->RH = -1.0f;
+                gpx->P = -1.0f;
+                gpx->alt  = -10000;
+                // new ID:
+                memcpy(gpx->id, sondeid_bytes, 8);
+                gpx->id[8] = '\0';
+
+                gpx->ecdat.last_frnb = 0;
+            }
         }
     }
 
     return 0;
 }
 
-static int get_FrameConf(gpx_t *gpx, int ofs) {
+static int get_FrameConf(int ofs) {
     int crc, err;
     ui8_t calfr;
     int i;
 
-    crc = check_CRC(gpx, pos_FRAME+ofs, pck_FRAME);
+    crc = check_CRC(pos_FRAME+ofs, pck_FRAME);
     if (crc) gpx->crc |= crc_FRAME;
 
     err = crc;
-    err |= get_SondeID(gpx, crc, ofs);
-    err |= get_FrameNb(gpx, crc, ofs);
-    err |= get_BattVolts(gpx, ofs);
+    err |= get_SondeID(crc, ofs);
+    err |= get_FrameNb(crc, ofs);
+    err |= get_BattVolts(ofs);
     if (gpx->frame[pos_BitField0D+ofs] & burst_det)
         gpx->burst = 1;
     else gpx->burst = 0; 
@@ -443,7 +450,7 @@ static int get_FrameConf(gpx_t *gpx, int ofs) {
 
 // ----------------------------------------------------------------------------------------------------
 
-static int get_CalData(gpx_t *gpx) {
+static int get_CalData() {
 
     int j;
 
@@ -510,7 +517,7 @@ static int get_CalData(gpx_t *gpx) {
 // temperature, platinum resistor
 // T-sensor:    gpx->ptu_co1 , gpx->ptu_calT1
 // T_RH-sensor: gpx->ptu_co2 , gpx->ptu_calT2
-static float get_T(gpx_t *gpx, ui32_t f, ui32_t f1, ui32_t f2, float *ptu_co, float *ptu_calT) {
+static float get_T(ui32_t f, ui32_t f1, ui32_t f2, float *ptu_co, float *ptu_calT) {
     float *p = ptu_co;
     float *c = ptu_calT;
     float  g = (float)(f2-f1)/(gpx->ptu_Rf2-gpx->ptu_Rf1),       // gain
@@ -525,7 +532,7 @@ static float get_T(gpx_t *gpx, ui32_t f, ui32_t f1, ui32_t f2, float *ptu_co, fl
 // (data:) ftp://ftp-cdc.dwd.de/climate_environment/CDC/observations_germany/radiosondes/
 // (diffAlt: Ellipsoid-Geoid)
 // (note: humidity sensor has significant time-lag at low temperatures)
-static float get_RHemp(gpx_t *gpx, ui32_t f, ui32_t f1, ui32_t f2, float T) {
+static float get_RHemp(ui32_t f, ui32_t f1, ui32_t f2, float T) {
     float a0 = 7.5;                    // empirical
     float a1 = 350.0/gpx->ptu_calH[0]; // empirical
     float fh = (f-f1)/(float)(f2-f1);
@@ -543,7 +550,7 @@ static float get_RHemp(gpx_t *gpx, ui32_t f, ui32_t f1, ui32_t f2, float T) {
 
 //
 // cf. github DF9DQ or stsst/RS-fork
-static float get_P(gpx_t *gpx, ui32_t f, ui32_t f1, ui32_t f2, int fx)
+static float get_P(ui32_t f, ui32_t f1, ui32_t f2, int fx)
 {
     double p = 0.0;
     double a0, a1, a0j, a1k;
@@ -567,7 +574,7 @@ static float get_P(gpx_t *gpx, ui32_t f, ui32_t f1, ui32_t f2, int fx)
 // ---------------------------------------------------------------------------------------
 //
 // Altitude calculation using barometric formula for standard atmosphere
-static int calc_PAlt(gpx_t *gpx) {
+static int calc_PAlt() {
     float Pb, Tb, Lb, hb, RgM = 8.31446/(9.80665*0.0289644);
     float pressure = gpx->P;  //hPa
 
@@ -603,7 +610,7 @@ static int calc_PAlt(gpx_t *gpx) {
 }
 
 
-static int get_PTU(gpx_t *gpx, int ofs, int pck) {
+static int get_PTU(int ofs, int pck) {
     int err=0, i;
     int bR, bc1, bT1,
             bc2, bT2;
@@ -615,9 +622,9 @@ static int get_PTU(gpx_t *gpx, int ofs, int pck) {
     float RH = -1.0;
     float P = -1.0;
 
-    get_CalData(gpx);
+    get_CalData();
 
-    err = check_CRC(gpx, pos_PTU+ofs, pck);
+    err = check_CRC(pos_PTU+ofs, pck);
     if (err) gpx->crc |= crc_PTU;
 
     if (err == 0)
@@ -641,29 +648,29 @@ static int get_PTU(gpx_t *gpx, int ofs, int pck) {
            && gpx->calfrchk[0x29] && gpx->calfrchk[0x2A];
 
         if (bR && bc1 && bT1) {
-            Tc = get_T(gpx, meas[0], meas[1], meas[2], gpx->ptu_co1, gpx->ptu_calT1);
+            Tc = get_T(meas[0], meas[1], meas[2], gpx->ptu_co1, gpx->ptu_calT1);
         }
         gpx->T = Tc;
 
         if (bR && bc2 && bT2) {
-            TH = get_T(gpx, meas[6], meas[7], meas[8], gpx->ptu_co2, gpx->ptu_calT2);
+            TH = get_T(meas[6], meas[7], meas[8], gpx->ptu_co2, gpx->ptu_calT2);
         }
         gpx->TH = TH;
 
         if (bH && Tc > -273.0) {
-            RH = get_RHemp(gpx, meas[3], meas[4], meas[5], Tc); // TH, TH-Tc (sensorT - T)
+            RH = get_RHemp(meas[3], meas[4], meas[5], Tc); // TH, TH-Tc (sensorT - T)
         }
         gpx->RH = RH;
 
         // cf. DF9DQ, stsst/RS-fork
         if (bP) {
-            P = get_P(gpx, meas[9], meas[10], meas[11], i2(gpx->frame+pos_PTU+ofs+2+38));
+            P = get_P(meas[9], meas[10], meas[11], i2(gpx->frame+pos_PTU+ofs+2+38));
         }
         gpx->P = P;
 
-        calc_PAlt(gpx);
+        calc_PAlt();
 
-        if (gpx->option.dbg == 1 && (gpx->crc & crc_PTU)==0)
+        if (option.dbg == 1 && (gpx->crc & crc_PTU)==0)
         {
             printf("1: %8d %8d %8d", meas[0], meas[1], meas[2]);
             printf("   #   ");
@@ -694,7 +701,7 @@ static int get_PTU(gpx_t *gpx, int ofs, int pck) {
 }
 
 
-static int get_Calconf(gpx_t *gpx, int out, int ofs) {
+static int get_Calconf(int out, int ofs) {
     int i;
     unsigned byte;
     ui8_t calfr = 0;
@@ -705,9 +712,9 @@ static int get_Calconf(gpx_t *gpx, int out, int ofs) {
 
     byte = gpx->frame[pos_CalData+ofs];
     calfr = byte;
-    err = check_CRC(gpx, pos_FRAME+ofs, pck_FRAME);
+    err = check_CRC(pos_FRAME+ofs, pck_FRAME);
 
-    if (gpx->option.sub == 1) {
+    if (option.sub == 1) {
         fprintf(stdout, "\n");  // fflush(stdout);
         fprintf(stdout, "[%5d] ", gpx->frnr);
         fprintf(stdout, " 0x%02x: ", calfr);
@@ -745,7 +752,7 @@ static int get_Calconf(gpx_t *gpx, int out, int ofs) {
         if (calfr == 0x31) {    // 0x59..0x5A
             ui16_t bt = gpx->frame[pos_CalData+ofs+7] + (gpx->frame[pos_CalData+ofs+8] << 8); // burst timer (short?)
             // fw >= 0x4ef5: default=[88 77]=0x7788sec=510min
-            if (out  && bt != 0x0000 && (gpx->option.dbg == 1  ||  gpx->conf_bk))
+            if (out  && bt != 0x0000 && (option.dbg == 1  ||  gpx->conf_bk))
                 fprintf(stdout, ": bt %.1fmin ", bt/60.0);
             gpx->conf_bt = bt;
         }
@@ -753,7 +760,7 @@ static int get_Calconf(gpx_t *gpx, int out, int ofs) {
         if (calfr == 0x32) {
             ui16_t cd = gpx->frame[pos_CalData+ofs+1] + (gpx->frame[pos_CalData+ofs+2] << 8); // countdown (bt or kt) (short?)
             if (out && cd != 0xFFFF &&
-                    (gpx->option.dbg == 1  ||  gpx->conf_bk || gpx->conf_kt != 0xFFFF)
+                    (option.dbg == 1  ||  gpx->conf_bk || gpx->conf_kt != 0xFFFF)
                ) fprintf(stdout, ": cd %.1fmin ", cd/60.0);
             gpx->conf_cd = cd;  // (short/i16_t) ?
         }
@@ -767,7 +774,7 @@ static int get_Calconf(gpx_t *gpx, int out, int ofs) {
             }
             if (out) fprintf(stdout, ": %s ", sondetyp);
             strcpy(gpx->rstyp, sondetyp);
-            if (out && gpx->option.dbg == 1) { // Stationsdruck QFE
+            if (out && option.dbg == 1) { // Stationsdruck QFE
                 float qfe1 = 0.0, qfe2 = 0.0;
                 memcpy(&qfe1, gpx->frame+pos_CalData+1, 4);
                 memcpy(&qfe2, gpx->frame+pos_CalData+5, 4);
@@ -789,7 +796,7 @@ static int get_Calconf(gpx_t *gpx, int out, int ofs) {
 #define rs_R 24
 #define rs_K (rs_N-rs_R)
 
-static int rs41_ecc(gpx_t *gpx, int msglen) {
+static int rs41_ecc(int msglen) {
 
     int i;
     int errors;
@@ -805,7 +812,7 @@ static int rs41_ecc(gpx_t *gpx, int msglen) {
     for (i = 0; i < rs_R;            i++) cw[i]      = gpx->frame[cfg_rs41.parpos+i];
     for (i = 0; i < cfg_rs41.msglen; i++) cw[rs_R+i] = gpx->frame[cfg_rs41.msgpos+i];
 
-    errors = rs_decode(&gpx->RS, cw, err_pos, err_val);
+    errors = rs_decode(&RS, cw, err_pos, err_val);
 
     for (i = 0; i < rs_R;            i++) gpx->frame[cfg_rs41.parpos+i] = cw[i];
     for (i = 0; i < cfg_rs41.msglen; i++) gpx->frame[cfg_rs41.msgpos+i] = cw[rs_R+i];
@@ -815,15 +822,15 @@ static int rs41_ecc(gpx_t *gpx, int msglen) {
 
 /* ------------------------------------------------------------------------------------ */
 
-static int prn_frm(gpx_t *gpx) {
+static int prn_frm() {
     fprintf(stdout, "[%5d] ", gpx->frnr);
     fprintf(stdout, "(%s) ", gpx->id);
-    if (gpx->option.dbg == 1) fprintf(stdout, "(%.1f V) ", gpx->batt);
+    if (option.dbg == 1) fprintf(stdout, "(%.1f V) ", gpx->batt);
     fprintf(stdout, " ");
     return 0;
 }
 
-static int prn_ptu(gpx_t *gpx) {
+static int prn_ptu() {
     fprintf(stdout, " ");
     if (gpx->T > -273.0) fprintf(stdout, " T=%.1fC ", gpx->T);
     if (gpx->RH > -0.5)  fprintf(stdout, " _RH=%.0f%% ", gpx->RH);
@@ -834,7 +841,7 @@ static int prn_ptu(gpx_t *gpx) {
     }
 
     // dew point
-    if (gpx->option.dwp)
+    if (option.dwp)
     {
         float rh = gpx->RH;
         float Td = -273.15f; // dew point Td
@@ -848,12 +855,12 @@ static int prn_ptu(gpx_t *gpx) {
 }
 
 
-static int print_position(gpx_t *gpx, int ec) {
+static int print_position(int ec) {
     int i;
     int err = 0, err0 = 0;
     int out;
     int ofs_ptu = 0, pck_ptu = 0;
-    if (gpx->option.slt || gpx->option.jsn==2) out = 0; else out = 1;
+    if (option.slt || option.jsn==2) out = 0; else out = 1;
 
     if ( ec >= 0 )
     {
@@ -869,7 +876,7 @@ static int print_position(gpx_t *gpx, int ec) {
         while (pos < flen-1) {
             blk = gpx->frame[pos];
             len = gpx->frame[pos+1];
-            crc = check_CRC(gpx, pos, blk<<8);
+            crc = check_CRC(pos, blk<<8);
             pck = (blk<<8) | len;
 
             if ( crc == 0 )  // ecc-OK, crc-OK
@@ -880,9 +887,9 @@ static int print_position(gpx_t *gpx, int ec) {
                     case pck_FRAME: // 0x7928
                             ofs = pos - pos_FRAME;
                             ofs_cal = ofs;
-                            err = get_FrameConf(gpx, ofs);
+                            err = get_FrameConf(ofs);
                             if ( !err ) {
-                                if (out) prn_frm(gpx);
+                                if (out) prn_frm();
                             }
                             break;
 
@@ -909,21 +916,21 @@ static int print_position(gpx_t *gpx, int ec) {
 
             if ( pos > frm_end )  // end of (sub)frame
             {
-                if (gpx->option.ptu && pck_ptu > 0) {
-                    err0 = get_PTU(gpx, ofs_ptu, pck_ptu);
-                    if (!err0 && out) prn_ptu(gpx);
+                if (option.ptu && pck_ptu > 0) {
+                    err0 = get_PTU(ofs_ptu, pck_ptu);
+                    if (!err0 && out) prn_ptu();
                 }
 
-                get_Calconf(gpx, out, ofs_cal);
+                get_Calconf(out, ofs_cal);
 
-                if (out && gpx->option.ecn && ec > 0 && pos > flen-1) fprintf(stdout, " (%d)", ec);
+                if (out && option.ecn && ec > 0 && pos > flen-1) fprintf(stdout, " (%d)", ec);
 
                 gpx->crc = 0;
                 frm_end = FRAME_LEN-2;
 
                 if (out) fprintf(stdout, "\n");
 
-                if (gpx->option.jsn || gpx->option.udp) {
+                if (option.jsn || option.udp) {
                     // Print out telemetry data as JSON
                     if (!err && !err0) {
                         char str[200], sentence[1000];
@@ -940,7 +947,7 @@ static int print_position(gpx_t *gpx, int ec) {
                             sprintf(str, ", \"cd\":%d",  gpx->conf_cd );
                             strcat(sentence, str);
                         }
-                        if (gpx->option.ptu) {
+                        if (option.ptu) {
                             float _RH = gpx->RH;
                             if (gpx->T > -273.0) {
                                 sprintf(str, ", \"temp\":%.1f",  gpx->T );
@@ -954,7 +961,7 @@ static int print_position(gpx_t *gpx, int ec) {
                                 sprintf(str, ", \"pressure\":%.2f",  gpx->P );
                                 strcat(sentence, str);
                             }
-                            if (gpx->alt >-10000 || gpx->option.arx) {
+                            if (gpx->alt >-10000 || option.arx) {
                                 sprintf(str, ", \"alt\":%d", gpx->alt);
                                 strcat(sentence, str);
                             }                            
@@ -971,12 +978,12 @@ static int print_position(gpx_t *gpx, int ec) {
                             sprintf(str, ", \"tx_frequency\":%d", gpx->freq );
                             strcat(sentence, str);
                         }
-                        if (gpx->option.arx) {
+                        if (option.arx || option.dat) {
                             time_t now;
                             now = time(NULL);
                             char dt_now[sizeof "2023-01-01T07:35:00Z"];
                             strftime(dt_now, sizeof dt_now, "%FT%TZ", gmtime(&now));
-                            sprintf(str, ", \"datetime\":\"%s\", \"lat\":0.0, \"lon\":0.0", dt_now );
+                            sprintf(str, ", \"datetime\":\"%s\"", dt_now );
                             strcat(sentence, str);
                         }
                         #ifdef VER_JSN_STR
@@ -986,17 +993,20 @@ static int print_position(gpx_t *gpx, int ec) {
                             sprintf(str, ", \"version\":\"%s\"", ver_jsn);
                             strcat(sentence, str);
                         }    
-                        for (int i = 0; i < ecnt; i++) {
-                            sprintf(str, ", \"%s\":\"%s\"", key[i], val[i]);
+                        for (int i = 0; i < extracnt; i++) {
+                            if ((val[i][0]>='0' && val[i][0]<='9') || val[i][0]=='-' || val[i][0]=='+') //number?
+                                sprintf(str, ", \"%s\":%s", key[i], val[i]);
+                            else
+                                sprintf(str, ", \"%s\":\"%s\"", key[i], val[i]);
                             strcat(sentence, str);
                         }
                         strcat(sentence, "}");
-                        if (!gpx->option.slt && gpx->option.jsn) {
+                        if (!option.slt && option.jsn) {
                             fprintf(stdout, "%s", sentence); //JSON string to sdout
                             fprintf(stdout, "\n");
                         }
-                        if (!gpx->option.slt && gpx->option.jsn==1) fprintf(stdout, "\n");
-                        if (gpx->option.udp)      //UDP packet
+                        if (!option.slt && option.jsn==1) fprintf(stdout, "\n");
+                        if (option.udp)      //UDP packet
                             send_UDP(sentence);
                     }
                 }
@@ -1010,9 +1020,9 @@ static int print_position(gpx_t *gpx, int ec) {
 
         gpx->crc = 0;
 
-        err = get_FrameConf(gpx, 0);
+        err = get_FrameConf(0);
         if (out && !err) {
-            prn_frm(gpx);
+            prn_frm();
             output = 1;
         }
 
@@ -1020,16 +1030,16 @@ static int print_position(gpx_t *gpx, int ec) {
 
         if (pck < 0x8000) {
 
-            err0 = get_PTU(gpx, 0, pck);
+            err0 = get_PTU(0, pck);
 
             if (out) {
 
-                if (!err0 && gpx->option.ptu) {
-                    prn_ptu(gpx);
+                if (!err0 && option.ptu) {
+                    prn_ptu();
                     output = 1;
                 }
 
-                if (gpx->option.dbg && output) {
+                if (option.dbg && output) {
                     fprintf(stdout, " ");
                     fprintf(stdout, "[");
                     for (i=0; i<2; i++) fprintf(stdout, "%d", (gpx->crc>>i)&1);
@@ -1040,7 +1050,7 @@ static int print_position(gpx_t *gpx, int ec) {
 
         if (out && output)
         {
-            if (gpx->option.ecn) {
+            if (option.ecn) {
                 if      (ec == -1)  fprintf(stdout, " (-+)");
                 else if (ec == -2)  fprintf(stdout, " (+-)");
                 else   /*ec == -3*/ fprintf(stdout, " (--)");
@@ -1051,7 +1061,7 @@ static int print_position(gpx_t *gpx, int ec) {
     return  0;
 }
 
-static void print_frame(gpx_t *gpx, int len) {
+static void print_frame(int len) {
     int i, ec = 0;
     float max_minscore = 0.0;
 
@@ -1075,13 +1085,13 @@ static void print_frame(gpx_t *gpx, int len) {
     }
     max_minscore = floor(max_minscore+1.5);
 
-    ec = rs41_ecc(gpx, len);
+    ec = rs41_ecc(len);
 
-    if (gpx->option.raw) {
+    if (option.raw) {
         for (i = 0; i < len; i++) {
             fprintf(stdout, "%02x", gpx->frame[i]);
         }
-        if (gpx->option.ecn) {
+        if (option.ecn) {
             if (ec >= 0) fprintf(stdout, " [OK]"); else fprintf(stdout, " [NO]");
             if (ec > 0) fprintf(stdout, " (%d)", ec);
             if (ec < 0) {
@@ -1091,12 +1101,12 @@ static void print_frame(gpx_t *gpx, int len) {
             }
         }
         fprintf(stdout, "\n");
-        if (gpx->option.slt && gpx->option.jsn) {
-            print_position(gpx, ec);
+        if (option.slt && option.jsn) {
+            print_position(ec);
         }
     }
     else {
-        print_position(gpx, ec);
+        print_position(ec);
     }
 }
 
@@ -1147,7 +1157,11 @@ int main(int argc, char *argv[]) {
 
     hdb_t hdb = {0};
 
-    gpx_t gpx = {0};
+    gpx_t gpx1 = {0};
+    gpx_t gpx2 = {0};
+    gpx1_pointer = &gpx1;
+    gpx2_pointer = &gpx2;
+    gpx = gpx1_pointer; //pointer to currently used dataset
 
 #ifdef CYGWIN
     _setmode(fileno(stdin), O_BINARY);
@@ -1172,18 +1186,18 @@ int main(int argc, char *argv[]) {
             return 0;
         }
         else if ( (strcmp(*argv, "-v")  == 0) ) { }
-        else if ( (strcmp(*argv, "--sub") == 0) ) { gpx.option.sub = 1; }
+        else if ( (strcmp(*argv, "--sub") == 0) ) { option.sub = 1; }
         else if ( (strcmp(*argv, "--aux") == 0) ) { }
-        else if   (strcmp(*argv, "--json") == 0)    { gpx.option.jsn = 1;}
-        else if   (strcmp(*argv, "--jsnonly") == 0) { gpx.option.jsn = 2;}
-        else if   (strcmp(*argv, "--eccn") == 0) { gpx.option.ecn = 1; }
-        else if   (strcmp(*argv, "--ptu" ) == 0) { gpx.option.ptu = 1; }
-        else if   (strcmp(*argv, "--dewp") == 0) { gpx.option.dwp = 1; }
+        else if   (strcmp(*argv, "--json") == 0)    { option.jsn = 1;}
+        else if   (strcmp(*argv, "--jsnonly") == 0) { option.jsn = 2;}
+        else if   (strcmp(*argv, "--eccn") == 0) { option.ecn = 1; }
+        else if   (strcmp(*argv, "--ptu" ) == 0) { option.ptu = 1; }
+        else if   (strcmp(*argv, "--dewp") == 0) { option.dwp = 1; }
         else if ( (strcmp(*argv, "-r") == 0) || (strcmp(*argv, "--raw") == 0) ) {
-            gpx.option.raw = 1;
+            option.raw = 1;
         }
         else if ( (strcmp(*argv, "-i") == 0) || (strcmp(*argv, "--invert") == 0) ) {
-            gpx.option.inv = 1;
+            option.inv = 1;
         }
         else if   (strcmp(*argv, "--jsn_cfq") == 0) {
             int frq = -1;  // center frequency / Hz
@@ -1195,7 +1209,7 @@ int main(int argc, char *argv[]) {
         else if   (strcmp(*argv, "--spike") == 0) { spike = 1; }
         else if   (strcmp(*argv, "--ch2") == 0) { sel_wavch = 1; }  // right channel (default: 0=left)
         else if   (strcmp(*argv, "--softin") == 0) { option_softin = 1; }  // float32 soft input
-        else if   (strcmp(*argv, "--silent") == 0) { gpx.option.slt = 1; }
+        else if   (strcmp(*argv, "--silent") == 0) { option.slt = 1; }
         else if   (strcmp(*argv, "--ths") == 0) {
             ++argv;
             if (*argv) {
@@ -1242,7 +1256,7 @@ int main(int argc, char *argv[]) {
             option_min = 1;
         }
 */
-        else if (strcmp(*argv, "--dbg" )   == 0) { gpx.option.dbg = 1; }
+        else if (strcmp(*argv, "--dbg" )   == 0) { option.dbg = 1; }
         else if (strcmp(*argv, "--rawhex") == 0) { rawhex = 2; }  // raw hex input
 /*        else if (strcmp(*argv, "-") == 0) {
             int sample_rate = 0, bits_sample = 0, channels = 0;
@@ -1261,20 +1275,21 @@ int main(int argc, char *argv[]) {
             option_pcmraw = 1;
         }
 */        else if   (strcmp(*argv, "-u") == 0) {
-            gpx.option.udp = 1;
+            option.udp = 1;
             hostcfg.sfd = -1;
             ++argv;
             if (*argv) hostcfg.host = *argv; else return -1;
             ++argv;
             if (*argv) hostcfg.port = *argv; else return -1;
         }
-        else if   (strcmp(*argv, "--autorx") == 0) { gpx.option.arx = 1;}
+        else if   (strcmp(*argv, "--autorx") == 0) { option.arx = 1;}
+        else if   (strcmp(*argv, "--datetime") == 0) { option.dat = 1;}
         else if   (strcmp(*argv, "--add") == 0) {
             ++argv;
-            if (*argv) key[ecnt] = *argv; else return -1;
+            if (*argv) key[extracnt] = *argv; else return -1;
             ++argv;
-            if (*argv) val[ecnt] = *argv; else return -1;
-            ++ecnt;
+            if (*argv) val[extracnt] = *argv; else return -1;
+            ++extracnt;
         }
         else {
             fp = fopen(*argv, "rb");
@@ -1288,8 +1303,8 @@ int main(int argc, char *argv[]) {
     }
     if (!fileloaded) fp = stdin;
 
-    if (gpx.option.ptu < 1) gpx.option.ptu = 1;
-    gpx.option.aut = 0;
+    if (option.ptu < 1) option.ptu = 1;
+    option.aut = 0;
     if (option_iq == 5 && option_dc) option_lp |= LP_FM;
 
     // LUT faster for decM, however frequency correction after decimation
@@ -1297,12 +1312,16 @@ int main(int argc, char *argv[]) {
     //
     if (option_noLUT && option_iq == 5) dsp.opt_nolut = 1; else dsp.opt_nolut = 0;
 
-    rs_init_RS255(&gpx.RS);
+    rs_init_RS255(&RS);
 
     // init gpx
-    memcpy(gpx.frame, RS41D_header_bytes, sizeof(RS41D_header_bytes)); // 6 header bytes
+    memcpy(gpx1.frame, RS41D_header_bytes, sizeof(RS41D_header_bytes)); // 6 header bytes
+    memcpy(gpx2.frame, RS41D_header_bytes, sizeof(RS41D_header_bytes));
 
-    if (cfreq > 0) gpx.jsn_freq = (cfreq+500)/1000;
+    if (cfreq > 0) {
+        gpx1.jsn_freq = (cfreq+500)/1000;
+        gpx2.jsn_freq = gpx1.jsn_freq;
+    }
 
 
     #ifdef EXT_FSK
@@ -1335,7 +1354,7 @@ int main(int argc, char *argv[]) {
 
             if (cfreq > 0) {
                 int fq_kHz = (cfreq - dsp.xlt_fq*pcm.sr + 500)/1e3;
-                gpx.jsn_freq = fq_kHz;
+                gpx->jsn_freq = fq_kHz;
             }
 
             symlen = 2;
@@ -1410,9 +1429,9 @@ int main(int argc, char *argv[]) {
             if (header_found == EOF) break;
 
             // mv == correlation score
-            if (_mv *(0.5-gpx.option.inv) < 0) {
-                if (gpx.option.aut == 0) header_found = 0;
-                else gpx.option.inv ^= 0x1;
+            if (_mv *(0.5-option.inv) < 0) {
+                if (option.aut == 0) header_found = 0;
+                else option.inv ^= 0x1;
             }
 
             if (header_found) {
@@ -1443,7 +1462,7 @@ int main(int argc, char *argv[]) {
                     }
                     if ( bitQ == EOF) break;
 
-                    if (gpx.option.inv) bit ^= 1;
+                    if (option.inv) bit ^= 1;
 
                     bitpos += 1;
                     bitbuf[b8pos] = bit;
@@ -1451,12 +1470,12 @@ int main(int argc, char *argv[]) {
                     if (b8pos >= BITS) {
                         b8pos = 0;
                         byte = bits2byte(bitbuf);
-                        gpx.frame[byte_count] = byte;
+                        gpx->frame[byte_count] = byte;
                         byte_count++;
                     }
                 }
                 header_found = 0;
-                print_frame(&gpx, byte_count);
+                print_frame(byte_count);
                 byte_count = FRAMESTART;
             }
         }
@@ -1488,9 +1507,9 @@ int main(int argc, char *argv[]) {
                 for (i = 0; i < len; i++) { //%2x  SCNx8=%hhx(inttypes.h)
                     sscanf(buffer_rawhex+2*i, "%2hhx", &frmbyte);
                     // wenn ohne %hhx: sscanf(buffer_rawhex+rawhex*i, "%2x", &byte); frame[frameofs+i] = (ui8_t)byte;
-                    gpx.frame[frameofs+i] = frmbyte;
+                    gpx->frame[frameofs+i] = frmbyte;
                 }
-                print_frame(&gpx, frameofs+len);
+                print_frame(frameofs+len);
             }
         }
     }
