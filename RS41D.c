@@ -387,7 +387,7 @@ static int get_SondeID(int crc, int ofs) {
             memcpy(gpx->frame, original_pointer->frame, FRAME_LEN);
 
             if ( strncmp(gpx->id, sondeid_bytes, 8) != 0 ) { //ID doesn't match the other dataset
-                                                               //reset data (only not recently used dataset)
+                                                               //reset data (of not recently used dataset)
                 memset(gpx->calfrchk, 0, 51); // 0x00..0x32
                 // reset conf data
                 memset(gpx->rstyp, 0, 9);
@@ -752,7 +752,7 @@ static int get_Calconf(int out, int ofs) {
         if (calfr == 0x31) {    // 0x59..0x5A
             ui16_t bt = gpx->frame[pos_CalData+ofs+7] + (gpx->frame[pos_CalData+ofs+8] << 8); // burst timer (short?)
             // fw >= 0x4ef5: default=[88 77]=0x7788sec=510min
-            if (out  && bt != 0x0000 && (option.dbg == 1  ||  gpx->conf_bk))
+            if (out && bt != 0x0000 && (option.dbg == 1  ||  gpx->conf_bk))
                 fprintf(stdout, ": bt %.1fmin ", bt/60.0);
             gpx->conf_bt = bt;
         }
@@ -763,6 +763,16 @@ static int get_Calconf(int out, int ofs) {
                     (option.dbg == 1  ||  gpx->conf_bk || gpx->conf_kt != 0xFFFF)
                ) fprintf(stdout, ": cd %.1fmin ", cd/60.0);
             gpx->conf_cd = cd;  // (short/i16_t) ?
+        }
+
+        if (calfr == 0x22) {
+            char mbver[10];
+            for (i = 0; i < 9; i++) {
+                byte = gpx->frame[pos_CalData+ofs + i + 3];
+                if (((byte >= 0x20) && (byte < 0x7F)) || (byte == 0x00)) mbver[i] = byte;
+            }
+            mbver[9] = '\0';
+            if (out) fprintf(stdout, ": %s ", mbver);
         }
 
         if (calfr == 0x21) {  // ... eventuell noch 2 bytes in 0x22
