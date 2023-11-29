@@ -335,6 +335,8 @@ static int get_SondeID() {
             gpx->_RH = -1.0f;
             gpx->_P  = -1.0f;
             gpx->alt  = -10000;
+            gpx->freq  = 0;
+            gpx->conf_kt = 0;
             // new ID:
             memcpy(gpx->id, sondeid_bytes, 8);  //store new ID
         }
