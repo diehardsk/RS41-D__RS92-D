@@ -59,7 +59,6 @@ typedef struct {
     i8_t dwp;  // PTU derived: dew point
     i8_t inv;  // inversion
     i8_t aut;
-//    i8_t aux;  // aux/ozone
     i8_t jsn;  // JSON output
     i8_t slt;  // silent (only raw/json)    
     i8_t dbg;  // debug
@@ -94,27 +93,27 @@ static char extracnt;
 
 #define crc_FRAME      (1<<0)
 #define pck_FRAME      0x7928
-#define pos_FRAME       0x01E
-#define pos_FrameNb     0x020  // 2 byte
-#define pos_SondeID     0x022  // 8 byte
-#define pos_BattVolts   0x02A  // 2 byte
-#define pos_BitField0D  0x02D  // 1 byte
+#define pos_FRAME        0x1E
+#define pos_FrameNb      0x20  // 2 byte
+#define pos_SondeID      0x22  // 8 byte
+#define pos_BattVolts    0x2A  // 2 byte
+#define pos_BitField0D   0x2D  // 1 byte
 #define burst_det      (1<<1)
-#define pos_CalData     0x037  // 1 byte, counter 0x00..0x32
-#define pos_Calfreq     0x03A  // 2 byte, calfr 0x00
-#define pos_Calburst    0x043  // 1 byte, calfr 0x02
+#define pos_CalData      0x37  // 1 byte, counter 0x00..0x32
+#define pos_Calfreq      0x3A  // 2 byte, calfr 0x00
+#define pos_Calburst     0x43  // 1 byte, calfr 0x02
 // ? #define pos_Caltimer  0x03F  // 2 byte, calfr 0x02 ?
-#define pos_CalRSTyp    0x040  // 8 byte, calfr 0x21 (+2 byte in 0x22?)
+#define pos_CalRSTyp     0x40  // 8 byte, calfr 0x21 (+2 byte in 0x22?)
         // weitere chars in calfr 0x22/0x23; weitere ID
 
 #define crc_PTU        (1<<1)
 #define pck_PTU        0x7A2A  // PTU
-#define pos_PTU         0x04A
+#define pos_PTU          0x4A
 
 
 #define crc_ZERO       (1<<2)  // LEN variable
-#define pck_ZERO       0x76
-#define pos_ZEROstd     0x078
+#define pck_ZERO         0x76
+#define pos_ZEROstd      0x78
 
 static char rs41d_rawheader[] = //"10010110010110010101" //DB 8N1 Manchester encoded
                                 //"10010110010110010101" //DB
@@ -568,7 +567,6 @@ static float get_P(ui32_t f, ui32_t f1, ui32_t f2, int fx)
         }
         a0j *= a0;
     }
-
     return (float)p;
 }
 // ---------------------------------------------------------------------------------------
@@ -796,7 +794,6 @@ static int get_Calconf(int out, int ofs) {
             }
         }
     }
-
     return 0;
 }
 
@@ -1236,7 +1233,7 @@ int main(int argc, char *argv[]) {
             }
             else return -1;
         }
-/*        else if   (strcmp(*argv, "--iq0") == 0) { option_iq = 1; }  // differential/FM-demod
+        else if   (strcmp(*argv, "--iq0") == 0) { option_iq = 1; }  // differential/FM-demod
         else if   (strcmp(*argv, "--iq2") == 0) { option_iq = 2; }
         else if   (strcmp(*argv, "--iq3") == 0) { option_iq = 3; }  // iq2==iq3
         else if   (strcmp(*argv, "--iqdc") == 0) { option_iqdc = 1; }  // iq-dc removal (iq0,2,3)
@@ -1265,10 +1262,10 @@ int main(int argc, char *argv[]) {
         else if   (strcmp(*argv, "--min") == 0) {
             option_min = 1;
         }
-*/
+
         else if (strcmp(*argv, "--dbg" )   == 0) { option.dbg = 1; }
         else if (strcmp(*argv, "--rawhex") == 0) { rawhex = 2; }  // raw hex input
-/*        else if (strcmp(*argv, "-") == 0) {
+        else if (strcmp(*argv, "-") == 0) {
             int sample_rate = 0, bits_sample = 0, channels = 0;
             ++argv;
             if (*argv) sample_rate = atoi(*argv); else return -1;
@@ -1284,7 +1281,7 @@ int main(int argc, char *argv[]) {
             pcm.nch = channels;
             option_pcmraw = 1;
         }
-*/        else if   (strcmp(*argv, "-u") == 0) {
+        else if   (strcmp(*argv, "-u") == 0) {
             option.udp = 1;
             hostcfg.sfd = -1;
             ++argv;
@@ -1413,9 +1410,6 @@ int main(int argc, char *argv[]) {
             //hdb.thb = 1.0 - 3.1/(float)hdb.len; // 1.0-max_bit_errors/hdrlen
             hdb.bufpos = -1;
             hdb.buf = NULL;
-            // caution ths=0.7: -3 byte offset, false positive
-            // 2A 2A 2A 2A 2A 10|65 10 ..
-            // header sync could be extended into the frame
             hdb.ths = 0.8;
             hdb.sbuf = calloc(hdb.len, sizeof(float));
             if (hdb.sbuf == NULL) {
